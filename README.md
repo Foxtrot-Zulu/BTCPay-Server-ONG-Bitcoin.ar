@@ -1,4 +1,4 @@
-# Documentación de Arquitectura e Instalación — BTCPay Server ONG BITCOIN.AR
+## Documentación de Arquitectura e Instalación — BTCPay Server ONG BITCOIN.AR
 
 ### Descripción General
 
@@ -8,23 +8,21 @@ Este deployment separa la infraestructura Bitcoin entre múltiples entornos:
   - BTCPay Server
   - NBXplorer
   - phoenixd
-  - Contenedor Tor
   - PostgreSQL
   - nginx reverse proxy
+  - Tailscale
 
 - Nodo Bitcoin externo:
   - Bitcoin Core
-  - Hidden Services Tor
   - Tailscale
   - Infraestructura existente
 
 La arquitectura fue diseñada para:
 
 - Evitar almacenar la blockchain en Azure
-- Mantener el tráfico P2P Bitcoin sobre Tor
-- Mantener RPC/ZMQ privados
+- Mantener RPC/ZMQ/P2P privados via Tailscale
 - Conectar Azure con el nodo externo usando ACLs de Tailscale
-- Integrar una wallet de phoenixd para Lighning Network
+- Integrar una wallet de phoenixd para Lightning Network
 
 ---
 
@@ -35,19 +33,15 @@ La arquitectura fue diseñada para:
                        │    Red Bitcoin P2P      │
                        └──────────┬──────────────┘
                                   │
-                               Tor P2P
-                                  │
-                                  ▼
                  ┌────────────────────────────────────┐
                  │  Bitcoin Core (Externo)            │
                  │------------------------------------│
                  │ - Bitcoin Core                     │
-                 │ - Hidden Services Tor              │
                  │ - Tailscale                        │
                  │ - Fulcrum / infraestructura extra  │
                  └───-───────────┬────────────────────┘
                                  │
-                       RPC/ZMQ vía Tailscale
+                   RPC/ZMQ/P2P vía Tailscale
                                  │
                                  ▼
                  ┌────────────────────────────────────┐
@@ -58,11 +52,10 @@ La arquitectura fue diseñada para:
                  │ - phoenixd                         │
                  │ - PostgreSQL                       │
                  │ - nginx                            │
-                 │ - Contenedor Tor                   │
                  │ - Tailscale                        │
                  └────────────────────────────────────┘
-
 ```
+
 ---
 
 ## Instalación BTCPay Server
@@ -86,7 +79,6 @@ generated_default
 | BTCPay Server | generated_btcpayserver_1 |
 | NBXplorer | generated_nbxplorer_1 |
 | PostgreSQL | generated_postgres_1 |
-| Tor | tor |
 | nginx | nginx |
 | phoenixd | phoenixd |
 
@@ -100,7 +92,7 @@ generated_default
 nodo externo: /media/datadrive/.bitcoin/bitcoin.conf
 ```
 
-## Configuración RPC Final
+### Configuración RPC Final
 
 ```conf
 server=1
@@ -118,34 +110,26 @@ rpcallowip=100.0.0.0/8
 whitelist=<IP_TAILSCALE_AZURE>
 ```
 
-## ZMQ
+### P2P Bind
+
+```conf
+bind=192.168.20.40:8333
+bind=<IP_TAILSCALE_NODO_BITCOIN>:8333
+```
+
+### ZMQ
 
 ```conf
 zmqpubrawblock=tcp://<IP_TAILSCALE_NODO_BITCOIN>:28332
 zmqpubrawtx=tcp://<IP_TAILSCALE_NODO_BITCOIN>:28333
 ```
 
----
+### Inicio
 
-## Hidden Services Tor
+Bitcoin Core debe arrancarse siempre con el datadir explícito:
 
-### Configuración torrc
-
-```conf
-HiddenServiceDir /var/lib/tor/bitcoin-rpc/
-HiddenServiceVersion 3
-HiddenServicePort 8332 127.0.0.1:8332
-HiddenServicePort 8333 127.0.0.1:8333
-HiddenServicePort 28332 127.0.0.1:28332
-HiddenServicePort 28333 127.0.0.1:28333
-```
-
-### Endpoint Onion Bitcoin
-
-Usado por NBXplorer:
-
-```text
-<ONION_BITCOIN>:8333
+```bash
+bitcoind -daemon -datadir=/media/datadrive/.bitcoin
 ```
 
 ---
@@ -154,19 +138,16 @@ Usado por NBXplorer:
 
 ### Objetivo
 
-Utilizar:
-- Tor para tráfico P2P Bitcoin
-- Tailscale únicamente para RPC/ZMQ
-
-Esto evita:
-- problemas de estabilidad RPC-over-onion
-- errores SOCKS/.NET dentro de NBXplorer
+Utilizar Tailscale para:
+- RPC Bitcoin Core
+- ZMQ Bitcoin Core
+- P2P Bitcoin Core (conexión NBXplorer → nodo)
 
 ---
 
 ## ACLs Tailscale
 
-### Luego de instalar Tailscale en ambos entornos, desde el administrador web de tailscale, editar la config ACL: 
+### Desde el administrador web de Tailscale, editar la config ACL:
 
 ```json
 {
@@ -179,7 +160,7 @@ Esto evita:
     {
       "src": ["tag:btcpay-azure"],
       "dst": ["tag:bitcoin-node"],
-      "ip": ["*:8332", "*:28332", "*:28333"]
+      "ip": ["*:8332", "*:8333", "*:28332", "*:28333"]
     }
   ],
 
@@ -221,22 +202,25 @@ Parámetros importantes:
 ```yaml
 NBXPLORER_BTCRPCURL: http://<IP_TAILSCALE_NODO_BITCOIN>:8332/
 
-NBXPLORER_BTCNODEENDPOINT: <ONION_BITCOIN>:8333
+NBXPLORER_BTCNODEENDPOINT: <IP_TAILSCALE_NODO_BITCOIN>:8333
 
-NBXPLORER_SOCKSENDPOINT: tor:9050
+NBXPLORER_BTCRPCUSER: <BTCRPCUSER>
+
+NBXPLORER_BTCRPCPASSWORD: <BTCRPCPASSWORD>
 ```
 
 ### Resultado Final
 
 - RPC vía Tailscale
-- P2P Bitcoin vía Tor
+- P2P Bitcoin vía Tailscale
+- ZMQ vía Tailscale
 - Sincronización estable
 
 ---
 
 ## Integración phoenixd
 
-### Instalada en: 
+### Instalada en:
 
 ```bash
 /root/BTCPayServer/volumes/phoenixd
@@ -257,13 +241,15 @@ NBXPLORER_SOCKSENDPOINT: tor:9050
 
 ### Deployment Final
 
-```bash
-docker run -d \
-  --name phoenixd \
-  --restart unless-stopped \
-  --network generated_default \
-  -v /root/BTCPayServer/volumes/phoenixd:/phoenix/.phoenix \
-  acinq/phoenixd:latest
+Phoenixd está integrado en el `docker-compose.generated.yml` como servicio:
+
+```yaml
+phoenixd:
+  restart: unless-stopped
+  container_name: phoenixd
+  image: acinq/phoenixd:latest
+  volumes:
+    - /root/BTCPayServer/volumes/phoenixd:/phoenix/.phoenix
 ```
 
 ### Importante
@@ -349,6 +335,12 @@ Especialmente:
 /media/datadrive/.bitcoin/bitcoin.conf
 ```
 
+### Comando Backup DB
+
+```bash
+docker exec generated_postgres_1 pg_dump -U postgres btcpayservermainnet > /root/backup_btcpay_$(date +%Y%m%d_%H%M).sql
+```
+
 ---
 
 ## Monitoreo Recomendado
@@ -375,23 +367,29 @@ docker logs phoenixd --tail 100
 
 ## Seguridad
 
-- No subas **`.env`** ni `volumes/**` con claves a repositorios públicos.  
-- En producción, **HTTPS** delante de BTCPay (Caddy, nginx, Traefik) y restringe **9740** si no la necesitas expuesta.
+- No subas **`.env`** ni `volumes/**` con claves a repositorios públicos.
+- En producción, **HTTPS** delante de BTCPay (nginx) y restringe **9740** si no la necesitas expuesta.
 - Antes de actualizar versiones, lee notas de migración de BTCPay Server y NBXplorer.
+- Luego de cada `btcpay-update.sh`, verificar que el hook post-update de Vaultwarden se ejecutó correctamente.
 
+---
 
 ## Lecciones Aprendidas
 
-### RPC-over-Onion
+### Bitcoin Core sin datadir explícito
 
-La conectividad RPC vía Tor es muy inestable.
-- Tailscale para RPC/ZMQ resultó mucho más estable
+Al reiniciar Bitcoin Core sin `-datadir`, arranca desde `~/.bitcoin` (bloque génesis).
+Siempre usar:
 
-Decisión final:
-- Tor solo para P2P Bitcoin
-- Tailscale para RPC/ZMQ
+```bash
+bitcoind -daemon -datadir=/media/datadrive/.bitcoin
+```
 
-Es la arquitectura recomendada para producción.
+Recomendado: configurar el servicio systemd con el flag `-datadir` para evitar este problema.
+
+### Tailscale para todo el tráfico NBXplorer
+
+Todo el tráfico entre NBXplorer y Bitcoin Core va por Tailscale: RPC, ZMQ y P2P.
 
 ---
 
@@ -400,11 +398,10 @@ Es la arquitectura recomendada para producción.
 Todos los componentes funcionando:
 
 - BTCPay Server
-- NBXplorer
+- NBXplorer (RPC + ZMQ + P2P via Tailscale)
 - Bitcoin Core remoto
-- Tor P2P
-- Tailscale RPC/ZMQ
 - phoenixd Lightning
 - Facturación Lightning
 - Pagos Lightning testeados correctamente
+- Vaultwarden integrado con nginx BTCPay (notas a la intalación de vaultwarden: https://github.com/Foxtrot-Zulu/vaultwarden-bitcoin.ar/blob/main/README.md)
 
